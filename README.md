@@ -54,6 +54,7 @@ This candidate moves the file area to native macOS AppKit controls while keeping
 - Fixed AppKit drag pasteboard handling for internal drags, multi-file drags, and Finder-style copy/move behavior.
 - Added regression coverage for AppKit file-area selection, drag pasteboard behavior, keyboard scrolling, and candidate release metadata.
 - Full ten-language notes: [v0.1.2-candidate](docs/releases/v0.1.2-candidate.md).
+- Previous download: [v0.1.2-candidate release](https://github.com/xalgolab/XalgoExplorer/releases/tag/v0.1.2-candidate).
 
 ### v0.1.1-candidate
 
