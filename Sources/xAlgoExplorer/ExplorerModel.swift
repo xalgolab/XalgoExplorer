@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import QuickLookThumbnailing
 import SwiftUI
@@ -21,12 +22,19 @@ final class ExplorerModel: ObservableObject {
     @Published var error: ExplorerError?
     @Published var fileInfo: FileInfoSheet?
     @Published var showingAbout = false
+    @Published private(set) var isPerformingFileOperation = false
     @Published private var sidebarShortcutURLs: [URL] = []
     @Published private var hiddenDefaultSidebarTargetIDs: Set<String> = []
     private var activeInternalDragPayload: InternalFileDragPayload?
     private var activeInternalDragExpiresAt: Date?
     private weak var activeInternalDragProvider: NSItemProvider?
     private var clipboardPasteboardChangeCount: Int?
+    private var reloadTasks: [PaneID: Task<Void, Never>] = [:]
+    private var reloadGenerations: [PaneID: UUID] = [:]
+    private let fileOperationWorker = FileOperationWorker()
+    private var fileOperationTask: Task<Void, Never>?
+    private var systemObservers: Set<AnyCancellable> = []
+    @Published private var mountedVolumeURLs = FileSystemService.mountedVolumes()
 
     let thumbnails = ThumbnailCache()
 
@@ -75,6 +83,7 @@ final class ExplorerModel: ObservableObject {
         applyStoredColumnWidths(assistTopPane)
         applyStoredColumnWidths(assistBottomPane)
 
+        observeSystemChanges()
         reloadAll()
     }
 
@@ -87,7 +96,7 @@ final class ExplorerModel: ObservableObject {
     }
 
     var canPaste: Bool {
-        focusedPane.isLocalDirectory && currentClipboardPayload() != nil
+        canPaste(in: focusedPane)
     }
 
     var canRenameSelection: Bool {
@@ -99,7 +108,7 @@ final class ExplorerModel: ObservableObject {
     }
 
     func canPaste(in pane: PaneState) -> Bool {
-        pane.isLocalDirectory && currentClipboardPayload() != nil
+        !isPerformingFileOperation && pane.isLocalDirectory && currentClipboardPayload() != nil
     }
 
     var availableViewModesForFocusedPane: [ExplorerViewMode] {
@@ -136,7 +145,7 @@ final class ExplorerModel: ObservableObject {
     }
 
     var utilitySidebarTargets: [SidebarTarget] {
-        var targets = FileSystemService.mountedVolumes()
+        var targets = mountedVolumeURLs
             .filter { $0.path != "/" }
             .map {
                 SidebarTarget(
@@ -164,8 +173,34 @@ final class ExplorerModel: ObservableObject {
     }
 
     func setFocus(_ id: PaneID) {
-        focusedPaneID = id
+        if focusedPaneID != id { focusedPaneID = id }
         paneInteractionRevision += 1
+    }
+
+    private func observeSystemChanges() {
+        NotificationCenter.default.publisher(for: .nativeFileDragSessionDidEnd)
+            .sink { [weak self] notification in
+                guard let self, notification.object as? ExplorerModel === self else { return }
+                self.clearActiveInternalDrag()
+            }
+            .store(in: &systemObservers)
+
+        let workspace = NSWorkspace.shared.notificationCenter
+        Publishers.Merge3(
+            workspace.publisher(for: NSWorkspace.didMountNotification),
+            workspace.publisher(for: NSWorkspace.didUnmountNotification),
+            workspace.publisher(for: NSWorkspace.didRenameVolumeNotification)
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in
+            self?.mountedVolumeURLs = FileSystemService.mountedVolumes()
+        }
+        .store(in: &systemObservers)
+
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &systemObservers)
     }
 
     func toggleAssist() {
@@ -288,30 +323,52 @@ final class ExplorerModel: ObservableObject {
     }
 
     func reload(_ pane: PaneState) {
+        reloadTasks[pane.id]?.cancel()
+        let generation = UUID()
+        reloadGenerations[pane.id] = generation
         guard pane.virtualPage == nil else {
             pane.entries = []
             pane.errorMessage = nil
+            pane.isLoading = false
+            reloadTasks[pane.id] = nil
             return
         }
 
-        do {
-            let loaded = try FileSystemService.entries(in: pane.url)
-            pane.entries = FileSystemService.sort(loaded, by: pane.sortField, ascending: pane.sortAscending)
-            pane.errorMessage = nil
-            pane.selectedIDs = pane.selectedIDs.filter { id in
-                pane.entries.contains { $0.id == id }
+        let url = pane.url
+        pane.isLoading = true
+        pane.errorMessage = nil
+        // Only the latest request for this pane may publish directory contents.
+        reloadTasks[pane.id] = Task { [weak self, weak pane] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try FileSystemService.entries(in: url) }
+            }.value
+            guard !Task.isCancelled, let self, let pane,
+                  self.reloadGenerations[pane.id] == generation,
+                  pane.url == url, pane.virtualPage == nil else { return }
+            switch result {
+            case .success(let loaded):
+                pane.entries = FileSystemService.sort(loaded, by: pane.sortField, ascending: pane.sortAscending)
+                let availableIDs = Set(pane.entries.map(\.id))
+                pane.selectedIDs.formIntersection(availableIDs)
+                if let anchor = pane.selectionAnchorID, !availableIDs.contains(anchor) {
+                    pane.selectionAnchorID = nil
+                }
+                if let cursor = pane.selectionCursorID, !availableIDs.contains(cursor) {
+                    pane.selectionCursorID = pane.selectedIDs.first
+                }
+            case .failure(let error):
+                pane.entries = []
+                pane.selectedIDs.removeAll()
+                pane.errorMessage = error.localizedDescription
             }
-            if let anchor = pane.selectionAnchorID, !pane.selectedIDs.contains(anchor) {
-                pane.selectionAnchorID = nil
-            }
-            if let cursor = pane.selectionCursorID, !pane.selectedIDs.contains(cursor) {
-                pane.selectionCursorID = pane.selectedIDs.first
-            }
-        } catch {
-            pane.entries = []
-            pane.errorMessage = error.localizedDescription
+            pane.isLoading = false
+            self.reloadTasks[pane.id] = nil
         }
         persist(pane)
+    }
+
+    func waitForPendingReloads() async {
+        for task in Array(reloadTasks.values) { await task.value }
     }
 
     func refreshFocusedPane() {
@@ -328,7 +385,10 @@ final class ExplorerModel: ObservableObject {
 
         pane.virtualPage = nil
         pane.url = url
+        pane.entries = []
         pane.selectedIDs.removeAll()
+        pane.selectionAnchorID = nil
+        pane.selectionCursorID = nil
         pane.renamingID = nil
         if pane.id == .main {
             searchText = ""
@@ -376,7 +436,8 @@ final class ExplorerModel: ObservableObject {
             pane.sortField = field
             pane.sortAscending = true
         }
-        reload(pane)
+        pane.entries = FileSystemService.sort(pane.entries, by: pane.sortField, ascending: pane.sortAscending)
+        persist(pane)
     }
 
     func setColumnWidth(_ width: CGFloat, for column: FileColumn, in pane: PaneState) {
@@ -387,10 +448,12 @@ final class ExplorerModel: ObservableObject {
     func toggleSortDirection(_ pane: PaneState? = nil) {
         let pane = pane ?? focusedPane
         pane.sortAscending.toggle()
-        reload(pane)
+        pane.entries = FileSystemService.sort(pane.entries, by: pane.sortField, ascending: pane.sortAscending)
+        persist(pane)
     }
 
     func openSearch() {
+        if searchOpen { NativePaneFocus.requestSearch() }
         searchOpen = true
     }
 
@@ -645,34 +708,51 @@ final class ExplorerModel: ObservableObject {
 
     func pasteClipboard(in pane: PaneState? = nil, to targetDirectory: URL? = nil) {
         let pane = pane ?? focusedPane
-        guard let clipboard = currentClipboardPayload(), pane.isLocalDirectory else { return }
+        guard !isPerformingFileOperation, let clipboard = currentClipboardPayload(), pane.isLocalDirectory else { return }
         let destination = targetDirectory ?? pane.url
-
-        do {
-            switch clipboard.operation {
-            case .copy:
-                try FileSystemService.copy(clipboard.urls, to: destination)
-            case .cut:
-                try FileSystemService.move(clipboard.urls, to: destination)
+        let changeCount = NSPasteboard.general.changeCount
+        let request: FileOperationRequest = clipboard.operation == .copy
+            ? .copy(clipboard.urls, to: destination) : .move(clipboard.urls, to: destination)
+        performFileOperation(request, errorTitle: "粘贴失败") { [weak self] in
+            if clipboard.operation == .cut, NSPasteboard.general.changeCount == changeCount {
+                guard let self else { return }
                 self.clipboard = nil
-                clipboardPasteboardChangeCount = nil
+                self.clipboardPasteboardChangeCount = nil
                 NSPasteboard.general.clearContents()
             }
-            reloadAll()
-        } catch {
-            showError("粘贴失败", error)
         }
     }
 
     func trashSelection() {
         let urls = selectedEntries(in: focusedPane).map(\.url)
-        guard !urls.isEmpty else { return }
-        do {
-            try FileSystemService.trash(urls)
-            reloadAll()
-        } catch {
-            showError("删除失败", error)
+        guard !urls.isEmpty, !isPerformingFileOperation else { return }
+        performFileOperation(.trash(urls), errorTitle: "删除失败")
+    }
+
+    private func performFileOperation(
+        _ request: FileOperationRequest,
+        errorTitle: String,
+        onSuccess: @escaping @MainActor () -> Void = {}
+    ) {
+        guard !isPerformingFileOperation else { return }
+        isPerformingFileOperation = true
+        fileOperationTask = Task { [weak self, fileOperationWorker] in
+            do {
+                try await fileOperationWorker.perform(request)
+                onSuccess()
+            } catch {
+                self?.showError(errorTitle, error)
+            }
+            guard let self else { return }
+            self.isPerformingFileOperation = false
+            self.reloadAll()
+            self.fileOperationTask = nil
         }
+    }
+
+    func waitForPendingFileOperations() async {
+        await fileOperationTask?.value
+        await waitForPendingReloads()
     }
 
     func beginRenameSelection() {
@@ -682,6 +762,7 @@ final class ExplorerModel: ObservableObject {
     }
 
     func beginRename(_ entry: FileEntry, in pane: PaneState) {
+        guard !isPerformingFileOperation else { return }
         focusedPaneID = pane.id
         pane.renamingID = entry.id
         pane.renameDraft = entry.name
@@ -824,7 +905,8 @@ final class ExplorerModel: ObservableObject {
         clearActiveInternalDrag()
 
         let sourceURLs = Self.fileURLsFromSystemPasteboard(pasteboard)
-        guard !sourceURLs.isEmpty else { return false }
+        guard !sourceURLs.isEmpty,
+              dropOperation(from: pasteboard, into: directory, intent: intent) != nil else { return false }
         performDropped(sourceURLs, into: directory, intent: intent)
         return true
     }
@@ -1010,6 +1092,7 @@ final class ExplorerModel: ObservableObject {
 
         if event.keyCode == 53, searchOpen {
             closeSearch()
+            NativePaneFocus.request(focusedPaneID)
             return true
         }
 
@@ -1079,7 +1162,7 @@ final class ExplorerModel: ObservableObject {
     }
 
     private func createItem(kind: NewItemKind, in pane: PaneState) {
-        guard pane.isLocalDirectory else { return }
+        guard pane.isLocalDirectory, !isPerformingFileOperation else { return }
         do {
             let url: URL
             switch kind {
@@ -1089,10 +1172,10 @@ final class ExplorerModel: ObservableObject {
                 url = try FileSystemService.createFile(in: pane.url)
             }
             reload(pane)
-            if let entry = pane.entries.first(where: { $0.url == url }) {
-                pane.selectedIDs = [entry.id]
-                beginRename(entry, in: pane)
-            }
+            pane.selectedIDs = [url.path]
+            pane.selectionCursorID = url.path
+            pane.renamingID = url.path
+            pane.renameDraft = url.lastPathComponent
         } catch {
             showError("新建失败", error)
         }
@@ -1254,17 +1337,9 @@ final class ExplorerModel: ObservableObject {
 
         guard !sourceURLs.isEmpty else { return }
 
-        do {
-            switch operation {
-            case .copy:
-                try FileSystemService.copy(sourceURLs, to: directory)
-            case .move:
-                try FileSystemService.move(sourceURLs, to: directory)
-            }
-            reloadAll()
-        } catch {
-            showError("拖放失败", error)
-        }
+        let request: FileOperationRequest = operation == .copy
+            ? .copy(sourceURLs, to: directory) : .move(sourceURLs, to: directory)
+        performFileOperation(request, errorTitle: "拖放失败")
     }
 
     private func canPerformDrop(
@@ -1272,7 +1347,8 @@ final class ExplorerModel: ObservableObject {
         into directory: URL,
         operation: FileDropOperation
     ) -> Bool {
-        sourceURLs.contains {
+        guard !isPerformingFileOperation else { return false }
+        return sourceURLs.contains {
             switch operation {
             case .copy:
                 return canCopyDroppedItem($0, into: directory)
@@ -1314,7 +1390,7 @@ final class ExplorerModel: ObservableObject {
            let payload = try? JSONDecoder().decode(InternalFileDragPayload.self, from: data) {
             return payload
         }
-        return freshActiveInternalDragPayload()
+        return nil
     }
 
     private func sourceURLs(from payload: InternalFileDragPayload) -> [URL] {
@@ -1472,16 +1548,22 @@ private extension NSEvent.ModifierFlags {
 
 @MainActor
 final class ThumbnailCache: ObservableObject {
-    @Published private(set) var images: [String: NSImage] = [:]
+    @Published private(set) var revision = 0
+    private let images = NSCache<NSString, NSImage>()
     private var requested: Set<String> = []
 
+    init() {
+        images.countLimit = 256
+        images.totalCostLimit = 64 * 1024 * 1024
+    }
+
     func image(for url: URL) -> NSImage? {
-        images[url.path]
+        images.object(forKey: url.path as NSString)
     }
 
     func request(url: URL, size: CGSize) {
         let key = url.path
-        guard images[key] == nil, !requested.contains(key) else { return }
+        guard images.object(forKey: key as NSString) == nil, !requested.contains(key) else { return }
         requested.insert(key)
 
         let request = QLThumbnailGenerator.Request(
@@ -1492,9 +1574,13 @@ final class ThumbnailCache: ObservableObject {
         )
 
         QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, _ in
-            guard let image = thumbnail?.nsImage else { return }
+            let image = thumbnail?.nsImage
             Task { @MainActor in
-                self?.images[key] = image
+                guard let self else { return }
+                self.requested.remove(key)
+                guard let image else { return }
+                self.images.setObject(image, forKey: key as NSString, cost: Int(size.width * size.height * 16))
+                self.revision += 1
             }
         }
     }

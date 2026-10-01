@@ -28,7 +28,7 @@ final class ClipboardTests: XCTestCase {
         XCTAssertEqual(urls?.map { ($0 as URL).standardizedFileURL }, [file.standardizedFileURL])
     }
 
-    func testPasteReadsFinderStyleSystemPasteboardFileURLs() throws {
+    func testPasteReadsFinderStyleSystemPasteboardFileURLs() async throws {
         let sourceRoot = try makeDirectory()
         let targetRoot = try makeDirectory()
         defer {
@@ -44,11 +44,12 @@ final class ClipboardTests: XCTestCase {
 
         XCTAssertTrue(model.canPaste(in: pane))
         model.pasteClipboard(in: pane, to: targetRoot)
+        await model.waitForPendingFileOperations()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: targetRoot.appendingPathComponent("finder-copy.txt").path))
     }
 
-    func testCutPasteBackIntoOriginalDirectoryDoesNotCreateDuplicate() throws {
+    func testCutPasteBackIntoOriginalDirectoryDoesNotCreateDuplicate() async throws {
         let root = try makeDirectory()
         defer {
             try? FileManager.default.removeItem(at: root)
@@ -60,6 +61,7 @@ final class ClipboardTests: XCTestCase {
 
         model.cutSelection(in: pane)
         model.pasteClipboard(in: pane, to: root)
+        await model.waitForPendingFileOperations()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("sample 1.txt").path))

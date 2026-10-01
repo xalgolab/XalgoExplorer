@@ -54,10 +54,10 @@ final class AppBundleTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertEqual(AppMetadata.version, "v0.1.2-candidate")
-        XCTAssertTrue(appScript.contains("<string>v0.1.2-candidate</string>"))
-        XCTAssertTrue(appScript.contains("<string>2</string>"))
-        XCTAssertTrue(dmgScript.contains("VERSION=\"v0.1.2-candidate\""))
+        XCTAssertEqual(AppMetadata.version, "v0.2.0-candidate")
+        XCTAssertTrue(appScript.contains("<string>v0.2.0-candidate</string>"))
+        XCTAssertTrue(appScript.contains("<string>3</string>"))
+        XCTAssertTrue(dmgScript.contains("VERSION=\"v0.2.0-candidate\""))
         XCTAssertTrue(dmgScript.contains("xAlgo_Explorer_${VERSION}_${ARCH_NAME}.dmg"))
     }
 
@@ -68,6 +68,7 @@ final class AppBundleTests: XCTestCase {
         )
 
         for marker in [
+            "## v0.2.0-candidate - 2026-10-01",
             "## v0.1.2-candidate - 2026-05-08",
             "### 简体中文",
             "### 繁體中文",

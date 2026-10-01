@@ -53,7 +53,7 @@ private extension FileDropOperation {
 
 enum AppKitSelectionScrollTarget {
     static func tableRow(entries: [FileEntry], selectedIDs: Set<FileEntry.ID>, cursorID: FileEntry.ID?) -> Int? {
-        if let cursorID,
+        if let cursorID, selectedIDs.contains(cursorID),
            let cursorRow = entries.firstIndex(where: { $0.id == cursorID }) {
             return cursorRow
         }
@@ -68,6 +68,50 @@ enum AppKitSelectionScrollTarget {
     }
 }
 
+struct AppKitFileAreaChanges {
+    let requiresReload: Bool
+    let changedIndexes: IndexSet
+
+    init(previous: [FileEntry], next: [FileEntry]) {
+        requiresReload = previous.map(\.id) != next.map(\.id)
+        changedIndexes = requiresReload ? [] : IndexSet(next.indices.filter { previous[$0] != next[$0] })
+    }
+}
+
+struct AppKitFileAreaSelection: Equatable {
+    let ids: Set<FileEntry.ID>
+    let cursorID: FileEntry.ID?
+
+    @MainActor init(pane: PaneState) {
+        ids = pane.selectedIDs
+        cursorID = pane.selectionCursorID
+    }
+}
+
+enum AppKitNativeSelection {
+    static func anchor(previous: FileEntry.ID?, cursor: FileEntry.ID?, selectedIDs: Set<FileEntry.ID>, extending: Bool) -> FileEntry.ID? {
+        guard !selectedIDs.isEmpty else { return nil }
+        if extending, let previous, selectedIDs.contains(previous) { return previous }
+        return cursor
+    }
+
+    static func marqueeSelection(initial: IndexSet, intersecting: IndexSet, modifiers: NSEvent.ModifierFlags) -> IndexSet {
+        if modifiers.contains(.command) { return initial.symmetricDifference(intersecting) }
+        if modifiers.contains(.shift) { return initial.union(intersecting) }
+        return intersecting
+    }
+
+    static func isNavigationKey(_ event: NSEvent) -> Bool {
+        [123, 124, 125, 126, 115, 119, 116, 121].contains(event.keyCode)
+            && event.modifierFlags.intersection([.command, .option, .control]).isEmpty
+    }
+}
+
+// The model owns the drag payload; its observer must clear it on every source-session end.
+extension Notification.Name {
+    static let nativeFileDragSessionDidEnd = Notification.Name("xAlgoExplorer.nativeFileDragSessionDidEnd")
+}
+
 @MainActor
 final class AppKitFileTableController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let scrollView = NSScrollView()
@@ -78,6 +122,22 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
     private var entries: [FileEntry] = []
     private var isApplyingSelection = false
     private var editingEntryID: FileEntry.ID?
+    private var renderedRenamingID: FileEntry.ID?
+    private var lastSelection: AppKitFileAreaSelection?
+    private var isSyncingColumns = false
+    private var selectionEvent: NSEvent?
+    private var interactionAnchorID: FileEntry.ID?
+    private var interactionRow: Int?
+    private var searchWasOpen = false
+    private var renderedURL: URL?
+    private var renderedVirtualPage: VirtualPage?
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard let model, let pane, model.focusedPaneID == pane.id,
+              !NativeCommandRouting.isTextInput(view.window?.firstResponder) else { return }
+        view.window?.makeFirstResponder(tableView)
+    }
 
     override func loadView() {
         view = NSView()
@@ -97,6 +157,7 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
         tableView.enclosingScrollView?.drawsBackground = false
         tableView.allowsMultipleSelection = true
         tableView.allowsEmptySelection = true
+        tableView.allowsColumnReordering = false
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.selectionHighlightStyle = .regular
         tableView.columnAutoresizingStyle = .noColumnAutoresizing
@@ -106,6 +167,8 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
         tableView.doubleAction = #selector(openSelectedEntry)
         tableView.target = self
         tableView.registerForDraggedTypes(AppKitFilePasteboard.acceptedTypes)
+        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: false)
         configureColumns()
 
         scrollView.documentView = tableView
@@ -119,26 +182,46 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
     }
 
     func configure(model: ExplorerModel, pane: PaneState, role: FilePaneRole) {
+        _ = view
+        let roleChanged = self.role != role
+        let paneChanged = self.pane !== pane
+        let restoreSearchFocus = searchWasOpen && !model.searchOpen
+        searchWasOpen = model.searchOpen
         self.model = model
         self.pane = pane
         self.role = role
+        renderedURL = pane.url
+        renderedVirtualPage = pane.virtualPage
+        tableView.identifier = NativePaneFocus.identifier(for: pane.id)
         let nextEntries = model.displayedEntries(for: pane)
-        let needsReload = entries.map(\.id) != nextEntries.map(\.id)
-            || entries.map(\.name) != nextEntries.map(\.name)
-            || entries.map(\.typeDescription) != nextEntries.map(\.typeDescription)
-            || entries.map(\.size) != nextEntries.map(\.size)
-            || entries.map(\.modified) != nextEntries.map(\.modified)
+        let changes = AppKitFileAreaChanges(previous: entries, next: nextEntries)
         entries = nextEntries
-        tableView.rowHeight = role == .main ? 34 : 28
+        let rowHeight: CGFloat = role == .main ? 34 : 28
+        if tableView.rowHeight != rowHeight { tableView.rowHeight = rowHeight }
         syncColumns()
-        if needsReload {
+        isApplyingSelection = true
+        if changes.requiresReload || paneChanged {
+            tableView.contentRevision &+= 1
             tableView.reloadData()
         } else {
-            tableView.reloadData(forRowIndexes: IndexSet(integersIn: 0..<entries.count), columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns))
+            var changedRows = changes.changedIndexes
+            if renderedRenamingID != pane.renamingID {
+                changedRows.formUnion(IndexSet(entries.indices.filter {
+                    entries[$0].id == renderedRenamingID || entries[$0].id == pane.renamingID
+                }))
+            }
+            refreshVisibleRows(roleChanged ? IndexSet(entries.indices) : changedRows)
         }
+        isApplyingSelection = false
+        renderedRenamingID = pane.renamingID
+        if pane.renamingID == nil { editingEntryID = nil }
+        if paneChanged { lastSelection = nil }
         applySelectionFromModel()
         startRenameIfNeeded()
         model.updateKeyboardColumnCount(1, in: pane)
+        if restoreSearchFocus && model.focusedPaneID == pane.id && pane.renamingID == nil {
+            NativePaneFocus.request(pane.id, in: view.window)
+        }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -177,13 +260,31 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isApplyingSelection,
               let model,
-              let pane else { return }
+              let pane, !pane.isLoading, pane.url == renderedURL, pane.virtualPage == renderedVirtualPage else { return }
         let selectedIDs = tableView.selectedRowIndexes
             .compactMap { entries.indices.contains($0) ? entries[$0].id : nil }
-        pane.selectedIDs = Set(selectedIDs)
-        pane.selectionAnchorID = selectedIDs.first
-        pane.selectionCursorID = selectedIDs.last
-        model.setFocus(pane.id)
+        let ids = Set(selectedIDs)
+        var row = interactionRow.flatMap { tableView.selectedRowIndexes.contains($0) ? $0 : nil }
+            ?? tableView.selectedRow
+        if let event = selectionEvent, event.type == .keyDown {
+            let added = tableView.selectedRowIndexes.filter { !pane.selectedIDs.contains(entries[$0].id) }
+            if !added.isEmpty {
+                row = [123, 126, 115, 116].contains(event.keyCode) ? added.first! : added.last!
+            } else if let cursor = pane.selectionCursorID, let previous = entries.firstIndex(where: { $0.id == cursor }),
+                      let nearest = tableView.selectedRowIndexes.min(by: { abs($0 - previous) < abs($1 - previous) }) {
+                row = nearest
+            }
+        }
+        let cursor = entries.indices.contains(row) ? entries[row].id : selectedIDs.last
+        let extending = selectionEvent?.modifierFlags.intersection([.shift, .command]).isEmpty == false
+        pane.selectionAnchorID = AppKitNativeSelection.anchor(
+            previous: selectionEvent == nil ? pane.selectionAnchorID : interactionAnchorID,
+            cursor: cursor, selectedIDs: ids, extending: extending
+        )
+        pane.selectionCursorID = cursor
+        if pane.selectedIDs != ids { pane.selectedIDs = ids }
+        lastSelection = AppKitFileAreaSelection(pane: pane)
+        if model.focusedPaneID != pane.id { model.setFocus(pane.id) }
     }
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
@@ -244,16 +345,14 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
     }
 
     func tableViewColumnDidResize(_ notification: Notification) {
-        guard let model, let pane,
+        guard !isSyncingColumns, let model, let pane,
               let column = notification.userInfo?["NSTableColumn"] as? NSTableColumn,
               let fileColumn = FileColumn(rawValue: column.identifier.rawValue) else {
             return
         }
-        model.setColumnWidth(column.width, for: fileColumn, in: pane)
-    }
-
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        AppKitFileTableRowView()
+        if abs(pane.width(for: fileColumn) - column.width) > 0.5 {
+            model.setColumnWidth(column.width, for: fileColumn, in: pane)
+        }
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -278,16 +377,46 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
         }
     }
 
-    func blankClick() {
+    func beginInteraction(_ event: NSEvent, row: Int? = nil) {
         guard let model, let pane else { return }
-        model.clearSelection(pane)
+        selectionEvent = event
+        interactionAnchorID = pane.selectionAnchorID
+        interactionRow = row
+        if event.type != .keyDown || model.focusedPaneID != pane.id { model.setFocus(pane.id) }
+        view.window?.makeFirstResponder(tableView)
+    }
+
+    func endInteraction() {
+        tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification))
+        if selectionEvent?.type == .keyDown, let pane,
+           let row = AppKitSelectionScrollTarget.tableRow(
+               entries: entries, selectedIDs: pane.selectedIDs, cursorID: pane.selectionCursorID
+           ) {
+            tableView.scrollRowToVisible(row)
+        }
+        selectionEvent = nil
+        interactionRow = nil
+    }
+
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard let model, let pane else { return false }
+        if model.focusedPaneID != pane.id { model.setFocus(pane.id) }
+        return model.handleKeyDown(event)
+    }
+
+    func didBecomeFirstResponder() {
+        guard let model, let pane, model.focusedPaneID != pane.id else { return }
+        model.setFocus(pane.id)
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        NotificationCenter.default.post(name: .nativeFileDragSessionDidEnd, object: model)
     }
 
     func entryMenu(for row: Int) -> NSMenu? {
         guard let model, let pane, entries.indices.contains(row) else { return blankMenu() }
         if !tableView.selectedRowIndexes.contains(row) {
             tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification))
         }
         return AppKitFileContextMenu.makeFileMenu(entry: entries[row], pane: pane, model: model)
     }
@@ -310,6 +439,7 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
             let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
             tableColumn.title = title(for: column)
             tableColumn.minWidth = column.minWidth
+            tableColumn.maxWidth = .greatestFiniteMagnitude
             tableColumn.resizingMask = .userResizingMask
             tableView.addTableColumn(tableColumn)
         }
@@ -317,18 +447,26 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
 
     private func syncColumns() {
         guard let pane else { return }
+        isSyncingColumns = true
+        defer { isSyncingColumns = false }
         for tableColumn in tableView.tableColumns {
             guard let column = FileColumn(rawValue: tableColumn.identifier.rawValue) else { continue }
             let width = pane.width(for: column)
             if abs(tableColumn.width - width) > 0.5 {
                 tableColumn.width = width
             }
-            tableColumn.headerCell.stringValue = headerTitle(for: column, pane: pane)
+            let nextTitle = headerTitle(for: column, pane: pane)
+            if tableColumn.headerCell.stringValue != nextTitle {
+                tableColumn.headerCell.stringValue = nextTitle
+            }
         }
     }
 
     private func applySelectionFromModel() {
         guard let pane else { return }
+        let selection = AppKitFileAreaSelection(pane: pane)
+        let shouldReveal = lastSelection != selection
+        lastSelection = selection
         let selectedRows = entries.enumerated().compactMap { index, entry in
             pane.selectedIDs.contains(entry.id) ? index : nil
         }
@@ -338,12 +476,26 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
             tableView.selectRowIndexes(nextSelection, byExtendingSelection: false)
             isApplyingSelection = false
         }
-        if let row = AppKitSelectionScrollTarget.tableRow(
+        if shouldReveal, let row = AppKitSelectionScrollTarget.tableRow(
             entries: entries,
             selectedIDs: pane.selectedIDs,
             cursorID: pane.selectionCursorID
         ) {
             tableView.scrollRowToVisible(row)
+        }
+    }
+
+    private func refreshVisibleRows(_ rows: IndexSet) {
+        for row in rows {
+            for (index, column) in tableView.tableColumns.enumerated() {
+                guard let cell = tableView.view(atColumn: index, row: row, makeIfNecessary: false) else { continue }
+                if let nameCell = cell as? AppKitFileNameTableCellView {
+                    nameCell.configure(entry: entries[row], pane: pane, role: role, delegate: self)
+                } else if let textCell = cell as? AppKitFileTextTableCellView,
+                          let fileColumn = FileColumn(rawValue: column.identifier.rawValue) {
+                    textCell.configure(text: text(for: fileColumn, entry: entries[row]), alignment: fileColumn == .size ? .right : .left)
+                }
+            }
         }
     }
 
@@ -354,13 +506,15 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
               let row = entries.firstIndex(where: { $0.id == renamingID }) else {
             return
         }
-        editingEntryID = renamingID
         tableView.scrollRowToVisible(row)
         DispatchQueue.main.async { [weak self] in
             guard let self,
+                  self.pane?.renamingID == renamingID,
+                  self.entries.indices.contains(row), self.entries[row].id == renamingID,
                   let view = self.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? AppKitFileNameTableCellView else {
                 return
             }
+            self.editingEntryID = renamingID
             view.beginEditing()
         }
     }
@@ -378,12 +532,7 @@ final class AppKitFileTableController: NSViewController, NSTableViewDataSource, 
     }
 
     private func title(for column: FileColumn) -> String {
-        switch column {
-        case .name: return "文件名"
-        case .modified: return "修改日期"
-        case .type: return "类型"
-        case .size: return "大小"
-        }
+        NativeCommandText.column(column, language: model?.language ?? "system")
     }
 
     private func headerTitle(for column: FileColumn, pane: PaneState) -> String {
@@ -436,6 +585,14 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
     private var entries: [FileEntry] = []
     private var isApplyingSelection = false
     private var editingEntryID: FileEntry.ID?
+    private var renderedRenamingID: FileEntry.ID?
+    private var lastSelection: AppKitFileAreaSelection?
+    private var selectionEvent: NSEvent?
+    private var interactionAnchorID: FileEntry.ID?
+    private var interactionIndexPath: IndexPath?
+    private var searchWasOpen = false
+    private var renderedURL: URL?
+    private var renderedVirtualPage: VirtualPage?
 
     override func loadView() {
         view = NSView()
@@ -454,14 +611,18 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
         layout.sectionInset = NSEdgeInsets(top: 8, left: 8, bottom: 18, right: 8)
 
         collectionView.owner = self
+        collectionView.autoresizingMask = [.width]
         collectionView.collectionViewLayout = layout
         collectionView.backgroundColors = [.clear]
         collectionView.isSelectable = true
         collectionView.allowsMultipleSelection = true
+        collectionView.allowsEmptySelection = true
         collectionView.dataSource = self
         collectionView.delegate = self
         collectionView.register(AppKitFileCollectionItem.self, forItemWithIdentifier: AppKitFileCollectionItem.reuseIdentifier)
         collectionView.registerForDraggedTypes(AppKitFilePasteboard.acceptedTypes)
+        collectionView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        collectionView.setDraggingSourceOperationMask([.copy, .move], forLocal: false)
 
         scrollView.documentView = collectionView
         view.addSubview(scrollView)
@@ -474,26 +635,66 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
     }
 
     func configure(model: ExplorerModel, thumbnails: ThumbnailCache, pane: PaneState, role: FilePaneRole, previewStyle: Bool) {
-        let oldPreviewStyle = self.previewStyle
+        _ = view
+        let layoutChanged = self.previewStyle != previewStyle || self.role != role || self.pane == nil
+        let paneChanged = self.pane !== pane
+        let restoreSearchFocus = searchWasOpen && !model.searchOpen
+        searchWasOpen = model.searchOpen
         self.model = model
         self.thumbnails = thumbnails
         self.pane = pane
         self.role = role
         self.previewStyle = previewStyle
+        renderedURL = pane.url
+        renderedVirtualPage = pane.virtualPage
+        collectionView.identifier = NativePaneFocus.identifier(for: pane.id)
         let nextEntries = model.displayedEntries(for: pane)
-        let needsReload = entries.map(\.id) != nextEntries.map(\.id)
-            || entries.map(\.name) != nextEntries.map(\.name)
-            || previewStyle != oldPreviewStyle
+        let changes = AppKitFileAreaChanges(previous: entries, next: nextEntries)
         entries = nextEntries
-        updateLayout()
-        if needsReload {
+        if layoutChanged { updateLayout() }
+        isApplyingSelection = true
+        if changes.requiresReload || paneChanged {
+            collectionView.contentRevision &+= 1
             collectionView.reloadData()
         } else {
-            collectionView.reloadItems(at: Set(entries.indices.map { IndexPath(item: $0, section: 0) }))
+            for indexPath in collectionView.indexPathsForVisibleItems() {
+                guard entries.indices.contains(indexPath.item),
+                      let item = collectionView.item(at: indexPath) as? AppKitFileCollectionItem else { continue }
+                let entry = entries[indexPath.item]
+                if layoutChanged || changes.changedIndexes.contains(indexPath.item)
+                    || (renderedRenamingID != pane.renamingID && (entry.id == renderedRenamingID || entry.id == pane.renamingID)) {
+                    item.configure(entry: entry, pane: pane, role: role, previewStyle: previewStyle, thumbnails: thumbnails, delegate: self)
+                } else if previewStyle {
+                    item.updateThumbnail(for: entry, thumbnails: thumbnails)
+                }
+            }
         }
+        isApplyingSelection = false
+        renderedRenamingID = pane.renamingID
+        if pane.renamingID == nil { editingEntryID = nil }
+        if paneChanged { lastSelection = nil }
         applySelectionFromModel()
         startRenameIfNeeded()
         updateKeyboardColumnCount()
+        if restoreSearchFocus && model.focusedPaneID == pane.id && pane.renamingID == nil {
+            NativePaneFocus.request(pane.id, in: view.window)
+        }
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let width = scrollView.contentSize.width
+        if width > 0 && abs(collectionView.frame.width - width) > 0.5 {
+            collectionView.setFrameSize(NSSize(width: width, height: collectionView.frame.height))
+        }
+        updateKeyboardColumnCount()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard let model, let pane, model.focusedPaneID == pane.id,
+              !NativeCommandRouting.isTextInput(view.window?.firstResponder) else { return }
+        view.window?.makeFirstResponder(collectionView)
     }
 
     func numberOfSections(in collectionView: NSCollectionView) -> Int {
@@ -610,9 +811,34 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
         }
     }
 
-    func blankClick() {
+    func beginInteraction(_ event: NSEvent, indexPath: IndexPath? = nil) {
         guard let model, let pane else { return }
-        model.clearSelection(pane)
+        selectionEvent = event
+        interactionAnchorID = pane.selectionAnchorID
+        interactionIndexPath = indexPath
+        if event.type != .keyDown || model.focusedPaneID != pane.id { model.setFocus(pane.id) }
+        view.window?.makeFirstResponder(collectionView)
+    }
+
+    func endInteraction() {
+        syncSelectionToModel()
+        selectionEvent = nil
+        interactionIndexPath = nil
+    }
+
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard let model, let pane else { return false }
+        if model.focusedPaneID != pane.id { model.setFocus(pane.id) }
+        return model.handleKeyDown(event)
+    }
+
+    func didBecomeFirstResponder() {
+        guard let model, let pane, model.focusedPaneID != pane.id else { return }
+        model.setFocus(pane.id)
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, dragOperation operation: NSDragOperation) {
+        NotificationCenter.default.post(name: .nativeFileDragSessionDidEnd, object: model)
     }
 
     func openEntry(at indexPath: IndexPath) {
@@ -633,21 +859,37 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
         return AppKitFileContextMenu.makeFileMenu(entry: entries[indexPath.item], pane: pane, model: model)
     }
 
-    private func syncSelectionToModel() {
+    func syncSelectionToModel() {
         guard !isApplyingSelection,
               let model,
-              let pane else { return }
+              let pane, !pane.isLoading, pane.url == renderedURL, pane.virtualPage == renderedVirtualPage else { return }
         let selectedIDs = collectionView.selectionIndexPaths
             .sorted()
             .compactMap { entries.indices.contains($0.item) ? entries[$0.item].id : nil }
-        pane.selectedIDs = Set(selectedIDs)
-        pane.selectionAnchorID = selectedIDs.first
-        pane.selectionCursorID = selectedIDs.last
-        model.setFocus(pane.id)
+        let ids = Set(selectedIDs)
+        let clickedID = interactionIndexPath.flatMap { indexPath in
+            entries.indices.contains(indexPath.item) && collectionView.selectionIndexPaths.contains(indexPath)
+                ? entries[indexPath.item].id : nil
+        }
+        let movingBackward = selectionEvent.map { $0.type == .keyDown && [123, 126, 115, 116].contains($0.keyCode) } ?? false
+        let added = selectedIDs.filter { !pane.selectedIDs.contains($0) }
+        let cursor = clickedID ?? (movingBackward ? selectedIDs.first : (added.last ?? selectedIDs.last))
+        let extending = selectionEvent?.modifierFlags.intersection([.shift, .command]).isEmpty == false
+        pane.selectionAnchorID = AppKitNativeSelection.anchor(
+            previous: selectionEvent == nil ? pane.selectionAnchorID : interactionAnchorID,
+            cursor: cursor, selectedIDs: ids, extending: extending
+        )
+        pane.selectionCursorID = cursor
+        if pane.selectedIDs != ids { pane.selectedIDs = ids }
+        lastSelection = AppKitFileAreaSelection(pane: pane)
+        if model.focusedPaneID != pane.id { model.setFocus(pane.id) }
     }
 
     private func applySelectionFromModel() {
         guard let pane else { return }
+        let selection = AppKitFileAreaSelection(pane: pane)
+        let shouldReveal = lastSelection != selection
+        lastSelection = selection
         let indexPaths = Set(entries.enumerated().compactMap { index, entry in
             pane.selectedIDs.contains(entry.id) ? IndexPath(item: index, section: 0) : nil
         })
@@ -656,7 +898,7 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
             collectionView.selectionIndexPaths = indexPaths
             isApplyingSelection = false
         }
-        if let indexPath = AppKitSelectionScrollTarget.collectionIndexPath(
+        if shouldReveal, let indexPath = AppKitSelectionScrollTarget.collectionIndexPath(
             entries: entries,
             selectedIDs: pane.selectedIDs,
             cursorID: pane.selectionCursorID
@@ -672,14 +914,16 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
               let index = entries.firstIndex(where: { $0.id == renamingID }) else {
             return
         }
-        editingEntryID = renamingID
         let indexPath = IndexPath(item: index, section: 0)
         collectionView.scrollToItems(at: [indexPath], scrollPosition: .nearestVerticalEdge)
         DispatchQueue.main.async { [weak self] in
             guard let self,
+                  self.pane?.renamingID == renamingID,
+                  self.entries.indices.contains(index), self.entries[index].id == renamingID,
                   let item = self.collectionView.item(at: indexPath) as? AppKitFileCollectionItem else {
                 return
             }
+            self.editingEntryID = renamingID
             item.beginEditing()
         }
     }
@@ -718,8 +962,101 @@ final class AppKitFileCollectionController: NSViewController, NSCollectionViewDa
     }
 }
 
+@MainActor
+private enum AppKitFileMarquee {
+    static func track(
+        in view: NSView,
+        event: NSEvent,
+        initialSelection: IndexSet,
+        isValid: () -> Bool,
+        indexesInRect: (NSRect) -> IndexSet,
+        applySelection: (IndexSet) -> Void
+    ) {
+        guard let window = view.window else { return }
+        let origin = view.convert(event.locationInWindow, from: nil)
+        let overlay = AppKitFileMarqueeView(frame: .zero)
+        view.addSubview(overlay)
+        defer { overlay.removeFromSuperview() }
+        let modifiers = event.modifierFlags
+        applySelection(AppKitNativeSelection.marqueeSelection(initial: initialSelection, intersecting: [], modifiers: modifiers))
+        var lastEvent = event
+        var isDragging = false
+
+        // Timeout callbacks keep native autoscroll running even when the pointer stops moving.
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown], timeout: 1.0 / 60, mode: .eventTracking) { nextEvent, stop in
+            guard isValid() else {
+                stop.pointee = true
+                return
+            }
+            guard view.window === window, window.isVisible, NSApp.isActive else {
+                applySelection(initialSelection)
+                stop.pointee = true
+                return
+            }
+            if let nextEvent {
+                if nextEvent.type == .keyDown {
+                    if nextEvent.keyCode == 53 {
+                        applySelection(initialSelection)
+                        stop.pointee = true
+                    }
+                    return
+                }
+                lastEvent = nextEvent
+                if nextEvent.type == .leftMouseUp { stop.pointee = true }
+            } else if NSEvent.pressedMouseButtons & 1 == 0 {
+                stop.pointee = true
+                return
+            }
+            let point = view.convert(lastEvent.locationInWindow, from: nil)
+            isDragging = isDragging || hypot(point.x - origin.x, point.y - origin.y) >= 4
+            guard isDragging else { return }
+            if !stop.pointee.boolValue { _ = view.autoscroll(with: lastEvent) }
+            let current = view.convert(lastEvent.locationInWindow, from: nil)
+            let rect = NSRect(x: min(origin.x, current.x), y: min(origin.y, current.y), width: abs(current.x - origin.x), height: abs(current.y - origin.y))
+            overlay.frame = rect
+            overlay.needsDisplay = true
+            applySelection(AppKitNativeSelection.marqueeSelection(initial: initialSelection, intersecting: indexesInRect(rect), modifiers: modifiers))
+        }
+    }
+}
+
+private final class AppKitFileMarqueeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).setFill()
+        bounds.fill()
+        NSColor.selectedContentBackgroundColor.setStroke()
+        NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)).stroke()
+    }
+}
+
 private final class AppKitFileTableView: NSTableView {
     weak var owner: AppKitFileTableController?
+    var contentRevision = 0
+
+    override func scrollRowToVisible(_ row: Int) {
+        guard row >= 0, row < numberOfRows, let scrollView = enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        let visible = convert(clipView.bounds, from: clipView)
+        guard visible.height > 0 else { return }
+        let target = rect(ofRow: row)
+        var y = visible.minY
+        if target.minY < visible.minY { y = target.minY }
+        if target.maxY > visible.maxY { y = target.maxY - visible.height }
+        guard abs(y - visible.minY) > 0.5 else { return }
+        // Avoid stacking animated native scroll requests during rapid key repeats.
+        var origin = clipView.bounds.origin
+        origin.y = clipView.convert(NSPoint(x: visible.minX, y: y), from: self).y
+        clipView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(clipView)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { owner?.didBecomeFirstResponder() }
+        return accepted
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
@@ -727,21 +1064,53 @@ private final class AppKitFileTableView: NSTableView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if row(at: point) == -1 {
-            owner?.blankClick()
+        let row = row(at: point)
+        owner?.beginInteraction(event, row: row >= 0 ? row : nil)
+        defer { owner?.endInteraction() }
+        if row == -1 && !event.modifierFlags.contains(.control) {
+            let revision = contentRevision
+            AppKitFileMarquee.track(in: self, event: event, initialSelection: selectedRowIndexes, isValid: { self.contentRevision == revision }) { rect in
+                let range = self.rows(in: rect)
+                guard range.location != NSNotFound else { return [] }
+                return IndexSet(integersIn: range.location..<min(NSMaxRange(range), self.numberOfRows))
+            } applySelection: { indexes in
+                if self.selectedRowIndexes != indexes {
+                    self.selectRowIndexes(indexes, byExtendingSelection: false)
+                }
+            }
+        } else {
+            super.mouseDown(with: event)
         }
-        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if AppKitNativeSelection.isNavigationKey(event) {
+            owner?.beginInteraction(event)
+            super.keyDown(with: event)
+            owner?.endInteraction()
+        } else if owner?.handleKeyDown(event) != true {
+            super.keyDown(with: event)
+        }
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         let row = self.row(at: point)
+        owner?.beginInteraction(event, row: row >= 0 ? row : nil)
+        defer { owner?.endInteraction() }
         return row >= 0 ? owner?.entryMenu(for: row) : owner?.blankMenu()
     }
 }
 
 private final class AppKitFileCollectionView: NSCollectionView {
     weak var owner: AppKitFileCollectionController?
+    var contentRevision = 0
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { owner?.didBecomeFirstResponder() }
+        return accepted
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
@@ -750,34 +1119,51 @@ private final class AppKitFileCollectionView: NSCollectionView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let indexPath = indexPathForItem(at: point)
-        if indexPath == nil {
-            owner?.blankClick()
+        owner?.beginInteraction(event, indexPath: indexPath)
+        defer { owner?.endInteraction() }
+        if indexPath == nil && !event.modifierFlags.contains(.control) {
+            let revision = contentRevision
+            AppKitFileMarquee.track(in: self, event: event, initialSelection: IndexSet(selectionIndexPaths.map(\.item)), isValid: { self.contentRevision == revision }) { rect in
+                let attributes = self.collectionViewLayout?.layoutAttributesForElements(in: rect) ?? []
+                return IndexSet(attributes.filter { $0.representedElementCategory == .item }.compactMap { $0.indexPath?.item })
+            } applySelection: { indexes in
+                let paths = Set(indexes.map { IndexPath(item: $0, section: 0) })
+                if self.selectionIndexPaths != paths {
+                    self.selectionIndexPaths = paths
+                    self.owner?.syncSelectionToModel()
+                }
+            }
+        } else {
+            super.mouseDown(with: event)
         }
-        super.mouseDown(with: event)
         if event.clickCount >= 2, let indexPath {
             owner?.openEntry(at: indexPath)
         }
     }
 
+    override func keyDown(with event: NSEvent) {
+        if AppKitNativeSelection.isNavigationKey(event) {
+            owner?.beginInteraction(event)
+            super.keyDown(with: event)
+            owner?.endInteraction()
+        } else if owner?.handleKeyDown(event) != true {
+            super.keyDown(with: event)
+        }
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
+        owner?.beginInteraction(event, indexPath: indexPathForItem(at: point))
+        defer { owner?.endInteraction() }
         return owner?.menu(for: indexPathForItem(at: point))
-    }
-}
-
-private final class AppKitFileTableRowView: NSTableRowView {
-    override func drawSelection(in dirtyRect: NSRect) {
-        guard selectionHighlightStyle != .none else { return }
-        let rect = bounds.insetBy(dx: 6, dy: 2)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
-        NSColor.selectedContentBackgroundColor.withAlphaComponent(0.78).setFill()
-        path.fill()
     }
 }
 
 private final class AppKitFileNameTableCellView: NSTableCellView {
     private let iconView = NSImageView()
     let nameField = AppKitRenameTextField()
+    private lazy var iconWidth = iconView.widthAnchor.constraint(equalToConstant: 22)
+    private lazy var iconHeight = iconView.heightAnchor.constraint(equalToConstant: 22)
 
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -793,12 +1179,15 @@ private final class AppKitFileNameTableCellView: NSTableCellView {
     func configure(entry: FileEntry, pane: PaneState?, role: FilePaneRole, delegate: NSTextFieldDelegate) {
         iconView.image = FileSystemService.appIcon(for: entry)
         nameField.entryID = entry.id
-        nameField.stringValue = pane?.renamingID == entry.id ? (pane?.renameDraft ?? entry.name) : entry.name
+        if nameField.currentEditor() == nil {
+            nameField.stringValue = pane?.renamingID == entry.id ? (pane?.renameDraft ?? entry.name) : entry.name
+        }
         nameField.delegate = delegate
         nameField.isEditable = pane?.renamingID == entry.id
         nameField.isSelectable = pane?.renamingID == entry.id
         nameField.font = .systemFont(ofSize: role == .main ? 13 : 12, weight: .regular)
-        iconView.setFrameSize(NSSize(width: role == .main ? 22 : 18, height: role == .main ? 22 : 18))
+        iconWidth.constant = role == .main ? 22 : 18
+        iconHeight.constant = iconWidth.constant
         toolTip = entry.url.path
     }
 
@@ -829,8 +1218,8 @@ private final class AppKitFileNameTableCellView: NSTableCellView {
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 22),
-            iconView.heightAnchor.constraint(equalToConstant: 22),
+            iconWidth,
+            iconHeight,
             nameField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
             nameField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             nameField.centerYAnchor.constraint(equalTo: centerYAnchor)
@@ -879,6 +1268,8 @@ private final class AppKitFileCollectionItem: NSCollectionViewItem {
     private let iconImageView = NSImageView()
     private let nameField = AppKitRenameTextField()
     private var entryID: FileEntry.ID?
+    private lazy var iconWidth = iconImageView.widthAnchor.constraint(equalToConstant: 44)
+    private lazy var iconHeight = iconImageView.heightAnchor.constraint(equalToConstant: 44)
 
     override func loadView() {
         view = container
@@ -902,6 +1293,8 @@ private final class AppKitFileCollectionItem: NSCollectionViewItem {
         NSLayoutConstraint.activate([
             iconImageView.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
             iconImageView.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            iconWidth,
+            iconHeight,
             nameField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
             nameField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
             nameField.topAnchor.constraint(equalTo: iconImageView.bottomAnchor, constant: 6),
@@ -925,7 +1318,9 @@ private final class AppKitFileCollectionItem: NSCollectionViewItem {
     ) {
         entryID = entry.id
         nameField.entryID = entry.id
-        nameField.stringValue = pane?.renamingID == entry.id ? (pane?.renameDraft ?? entry.name) : entry.name
+        if nameField.currentEditor() == nil {
+            nameField.stringValue = pane?.renamingID == entry.id ? (pane?.renameDraft ?? entry.name) : entry.name
+        }
         nameField.delegate = delegate
         nameField.isEditable = pane?.renamingID == entry.id
         nameField.isSelectable = pane?.renamingID == entry.id
@@ -940,12 +1335,14 @@ private final class AppKitFileCollectionItem: NSCollectionViewItem {
         }
 
         let imageSize: CGFloat = previewStyle ? 82 : (role == .main ? 44 : 32)
-        iconImageView.constraints
-            .filter { $0.firstAttribute == .width || $0.firstAttribute == .height }
-            .forEach { iconImageView.removeConstraint($0) }
-        iconImageView.widthAnchor.constraint(equalToConstant: imageSize).isActive = true
-        iconImageView.heightAnchor.constraint(equalToConstant: imageSize).isActive = true
+        iconWidth.constant = imageSize
+        iconHeight.constant = imageSize
         updateSelectionBackground()
+    }
+
+    func updateThumbnail(for entry: FileEntry, thumbnails: ThumbnailCache?) {
+        guard entryID == entry.id, let image = thumbnails?.image(for: entry.url), iconImageView.image !== image else { return }
+        iconImageView.image = image
     }
 
     func beginEditing() {
@@ -970,28 +1367,34 @@ private final class AppKitRenameTextField: NSTextField {
 private enum AppKitFileContextMenu {
     static func makeFileMenu(entry: FileEntry, pane: PaneState, model: ExplorerModel) -> NSMenu {
         let menu = AppKitActionMenu()
+        menu.autoenablesItems = false
         let target = AppKitMenuActionTarget(model: model, pane: pane, entry: entry)
         menu.actionTarget = target
-        menu.addItem(item(FileContextMenuLayout.chooseApplicationOpenTitle, action: #selector(AppKitMenuActionTarget.chooseApplication), target: target))
-        menu.addItem(item(FileContextMenuLayout.copyURLTitle, action: #selector(AppKitMenuActionTarget.copyURL), target: target))
+        menu.addItem(item(model.commandText(.chooseApplication), action: #selector(AppKitMenuActionTarget.chooseApplication), target: target))
+        menu.addItem(item(model.commandText(.copyURL), action: #selector(AppKitMenuActionTarget.copyURL), target: target))
         menu.addItem(.separator())
-        menu.addItem(item("剪切", action: #selector(AppKitMenuActionTarget.cut), target: target))
-        menu.addItem(item("复制", action: #selector(AppKitMenuActionTarget.copyItem), target: target))
-        let paste = item("粘贴", action: #selector(AppKitMenuActionTarget.paste), target: target)
+        menu.addItem(item(model.commandText(.cut), action: #selector(AppKitMenuActionTarget.cut), target: target))
+        menu.addItem(item(model.commandText(.copy), action: #selector(AppKitMenuActionTarget.copyItem), target: target))
+        let paste = item(model.commandText(.paste), action: #selector(AppKitMenuActionTarget.paste), target: target)
         paste.isEnabled = model.canPaste(in: pane)
         menu.addItem(paste)
         menu.addItem(.separator())
-        menu.addItem(item("删除", action: #selector(AppKitMenuActionTarget.trash), target: target))
-        menu.addItem(item("重命名", action: #selector(AppKitMenuActionTarget.rename), target: target))
-        menu.addItem(item("属性", action: #selector(AppKitMenuActionTarget.info), target: target))
+        let trash = item(model.commandText(.moveToTrash), action: #selector(AppKitMenuActionTarget.trash), target: target)
+        trash.isEnabled = !model.isPerformingFileOperation
+        menu.addItem(trash)
+        let rename = item(model.commandText(.rename), action: #selector(AppKitMenuActionTarget.rename), target: target)
+        rename.isEnabled = !model.isPerformingFileOperation
+        menu.addItem(rename)
+        menu.addItem(item(model.commandText(.info), action: #selector(AppKitMenuActionTarget.info), target: target))
         return menu
     }
 
     static func makeBlankMenu(pane: PaneState, model: ExplorerModel) -> NSMenu {
         let menu = AppKitActionMenu()
+        menu.autoenablesItems = false
         let target = AppKitMenuActionTarget(model: model, pane: pane, entry: nil)
         menu.actionTarget = target
-        let paste = item("粘贴", action: #selector(AppKitMenuActionTarget.paste), target: target)
+        let paste = item(model.commandText(.paste), action: #selector(AppKitMenuActionTarget.paste), target: target)
         paste.isEnabled = model.canPaste(in: pane)
         menu.addItem(paste)
         return menu
@@ -1033,36 +1436,43 @@ private final class AppKitMenuActionTarget: NSObject {
 
     @objc func cut() {
         guard let model, let pane, let entry else { return }
-        model.select(entry, in: pane)
+        focusSelection(containing: entry, pane: pane, model: model)
         model.cutSelection(in: pane)
     }
 
     @objc func copyItem() {
         guard let model, let pane, let entry else { return }
-        model.select(entry, in: pane)
+        focusSelection(containing: entry, pane: pane, model: model)
         model.copySelection(in: pane)
     }
 
     @objc func paste() {
-        guard let model, let pane else { return }
+        guard let model, let pane, model.canPaste(in: pane) else { return }
         let destination = entry.flatMap { $0.isDirectory && !$0.isPackage ? $0.url : nil } ?? pane.url
         model.setFocus(pane.id)
         model.pasteClipboard(in: pane, to: destination)
     }
 
     @objc func trash() {
-        guard let model, let pane, let entry else { return }
-        model.select(entry, in: pane)
+        guard let model, let pane, let entry, !model.isPerformingFileOperation else { return }
+        focusSelection(containing: entry, pane: pane, model: model)
         model.trashSelection()
     }
 
     @objc func rename() {
-        guard let model, let pane, let entry else { return }
+        guard let model, let pane, let entry, !model.isPerformingFileOperation else { return }
         model.beginRename(entry, in: pane)
     }
 
     @objc func info() {
         guard let model, let entry else { return }
         model.showInfo(for: entry)
+    }
+
+    private func focusSelection(containing entry: FileEntry, pane: PaneState, model: ExplorerModel) {
+        model.setFocus(pane.id)
+        if !pane.selectedIDs.contains(entry.id) {
+            model.select(entry, in: pane, modifiers: [])
+        }
     }
 }

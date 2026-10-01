@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT_DIR/dist/xAlgo Explorer.app"
 INFO_PLIST="$APP_DIR/Contents/Info.plist"
 STAGE_DIR="$ROOT_DIR/dist/dmg-root"
-VERSION="v0.1.2-candidate"
+VERSION="v0.2.0-candidate"
 ARCH_NAME="aarch64"
 VOL_NAME="xAlgo Explorer"
 DMG_PATH="$ROOT_DIR/dist/xAlgo_Explorer_${VERSION}_${ARCH_NAME}.dmg"
@@ -47,7 +47,7 @@ hdiutil create \
   -ov \
   "$DMG_PATH"
 
-shasum -a 256 "$DMG_PATH" > "$CHECKSUM_PATH"
+(cd "$ROOT_DIR/dist" && shasum -a 256 "$(basename "$DMG_PATH")") > "$CHECKSUM_PATH"
 rm -rf "$STAGE_DIR"
 
 echo "$DMG_PATH"

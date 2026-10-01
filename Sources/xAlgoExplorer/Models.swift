@@ -150,7 +150,7 @@ enum VirtualPage: String, Codable {
     }
 }
 
-struct FileEntry: Identifiable, Hashable {
+struct FileEntry: Identifiable, Hashable, Sendable {
     let url: URL
     let name: String
     let isDirectory: Bool
@@ -242,6 +242,7 @@ final class PaneState: ObservableObject, Identifiable {
     @Published var sortField: SortField
     @Published var sortAscending: Bool
     @Published var errorMessage: String?
+    @Published var isLoading = false
     @Published var renamingID: FileEntry.ID?
     @Published var renameDraft = ""
     @Published var columnNameWidth: CGFloat
@@ -249,8 +250,8 @@ final class PaneState: ObservableObject, Identifiable {
     @Published var columnTypeWidth: CGFloat
     @Published var columnSizeWidth: CGFloat
 
-    var backStack: [URL] = []
-    var forwardStack: [URL] = []
+    @Published var backStack: [URL] = []
+    @Published var forwardStack: [URL] = []
     var selectionAnchorID: FileEntry.ID?
     var selectionCursorID: FileEntry.ID?
     var keyboardColumnCount = 1

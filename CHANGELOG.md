@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.2.0-candidate - 2026-10-01
+
+Testing prerelease: [release notes and validation limits](docs/releases/v0.2.0-candidate.md). Ad-hoc signed; not Developer ID notarized.
+
+### 简体中文
+
+- 原生界面重构：标准 AppKit 标题栏、系统按钮与菜单、NSSearchField、可调整的三工作区分割视图。
+- macOS 26 起使用 Apple Liquid Glass API；macOS 14/15 回退至系统材质，侧栏与工具条使用一致效果。
+- 保留已确认的分区导航、查看、排序、焦点编辑、剪贴板和文件拖拽定义。
+- 目录读取及复制、移动、废纸篓操作移出主线程；旧目录结果不覆盖新导航；选择变化不重载整个文件区。
+- 原生方向键、圈选滚动、多选右键菜单、搜索取消与焦点恢复；菜单和悬停提示覆盖十种语言。
+- 清理废弃 SwiftUI 文件区实现，拆分侧栏、工具条、设置和窗口管理，增加原生事件与文件安全测试。
+
+### 繁體中文
+
+- 重構原生視窗、分割工作區、按鈕、搜尋與選單；macOS 26 起採用系統 Liquid Glass，舊版使用系統材質。
+- 保留既有功能定義，改善背景檔案操作、選取更新、鍵盤與焦點路由，補齊十語言命令及測試。
+
+### English
+
+- Rebuilt the native shell with the standard AppKit title bar, buttons, search, menus, and resizable split views. Uses system Liquid Glass on macOS 26+, with native material on older supported systems.
+- Preserved existing feature semantics; added background file operations, incremental selection updates, native focus/keyboard routing, ten-language commands, and regression tests.
+
+### 日本語
+
+- 標準 AppKit タイトルバー、ボタン、検索、メニュー、サイズ変更可能な分割表示に再構成。macOS 26 以降はシステムの Liquid Glass、旧対応 OS は標準マテリアルを使用します。
+- 既存の機能仕様を維持し、バックグラウンド処理、選択更新、キー操作とフォーカス、10言語のコマンド、回帰テストを改善しました。
+
+### 한국어
+
+- 기본 AppKit 제목 표시줄, 버튼, 검색, 메뉴와 크기 조절 분할 화면으로 재구성했습니다. macOS 26 이상은 시스템 Liquid Glass, 이전 지원 버전은 기본 소재를 사용합니다.
+- 기존 기능을 유지하면서 백그라운드 파일 작업, 선택 갱신, 키보드와 포커스, 10개 언어 명령 및 회귀 테스트를 개선했습니다.
+
+### Français
+
+- Interface native remaniée : barre de titre AppKit standard, boutons, recherche, menus et panneaux redimensionnables. Liquid Glass système sur macOS 26+, matériau natif sur les versions antérieures prises en charge.
+- Comportements conservés ; opérations en arrière-plan, sélection incrémentale, clavier et focus natifs, commandes en dix langues et tests de régression améliorés.
+
+### Deutsch
+
+- Native Oberfläche mit Standard-AppKit-Titelleiste, Schaltflächen, Suche, Menüs und verstellbaren Bereichen. System-Liquid-Glass ab macOS 26, natives Material auf älteren unterstützten Versionen.
+- Bestehendes Verhalten bleibt erhalten; Hintergrundoperationen, inkrementelle Auswahlaktualisierung, Tastatur/Fokus, Befehle in zehn Sprachen und Regressionstests verbessert.
+
+### Español
+
+- Interfaz nativa renovada con barra de título AppKit, botones, búsqueda, menús y paneles ajustables. Liquid Glass del sistema en macOS 26+ y material nativo en versiones anteriores compatibles.
+- Se conserva el comportamiento existente; mejoras en operaciones en segundo plano, selección incremental, teclado, foco, comandos en diez idiomas y pruebas de regresión.
+
+### Português
+
+- Interface nativa refeita com barra de título AppKit, botões, pesquisa, menus e painéis ajustáveis. Liquid Glass do sistema no macOS 26+ e material nativo nas versões anteriores compatíveis.
+- Comportamentos preservados; melhorias nas operações em segundo plano, seleção incremental, teclado, foco, comandos em dez idiomas e testes de regressão.
+
+### Русский
+
+- Обновлён нативный интерфейс: стандартная строка заголовка AppKit, кнопки, поиск, меню и изменяемые панели. Системный Liquid Glass на macOS 26+, нативный материал на более ранних поддерживаемых версиях.
+- Сохранено прежнее поведение; улучшены фоновые файловые операции, обновление выделения, клавиатура, фокус, команды на десяти языках и регрессионные тесты.
+
 ## v0.1.2-candidate - 2026-05-08
 
 ### 简体中文

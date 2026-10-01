@@ -138,7 +138,7 @@ final class DragDropTests: XCTestCase {
         XCTAssertEqual(secondItem.string(forType: .fileURL), second.absoluteString)
     }
 
-    func testAppKitPasteboardInternalDropMovesItemIntoTargetDirectory() throws {
+    func testAppKitPasteboardInternalDropMovesItemIntoTargetDirectory() async throws {
         let root = FileManager.default
             .temporaryDirectory
             .appendingPathComponent("xAlgoExplorerDragDropTests-\(UUID().uuidString)")
@@ -161,6 +161,7 @@ final class DragDropTests: XCTestCase {
 
         XCTAssertEqual(model.dropOperation(from: pasteboard, into: target, intent: .automatic), .move)
         XCTAssertTrue(model.handleDrop(from: pasteboard, into: target))
+        await model.waitForPendingFileOperations()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathComponent("sample.txt").path))
@@ -286,6 +287,47 @@ final class DragDropTests: XCTestCase {
 
         XCTAssertFalse(model.canDropActiveInternalDrag(into: folder))
         XCTAssertFalse(model.canDropActiveInternalDrag(into: child))
+    }
+
+    func testExternalPasteboardCannotReuseCachedInternalDrag() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("source")
+        let target = root.appendingPathComponent("target")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stale = source.appendingPathComponent("cancelled.txt")
+        let current = source.appendingPathComponent("current.txt")
+        try Data("stale".utf8).write(to: stale)
+        try Data("current".utf8).write(to: current)
+        let model = ExplorerModel()
+        _ = dragPasteboardItem(for: stale, in: source, model: model)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.writeObjects([current as NSURL])
+
+        XCTAssertTrue(model.handleDrop(from: pasteboard, into: target))
+        await model.waitForPendingFileOperations()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stale.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: current.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathComponent("current.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("cancelled.txt").path))
+    }
+
+    func testExternalPasteboardDropIntoOriginalDirectoryIsRejected() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("sample.txt")
+        try Data("test".utf8).write(to: file)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.writeObjects([file as NSURL])
+        let model = ExplorerModel()
+        XCTAssertFalse(model.handleDrop(from: pasteboard, into: root))
+        XCTAssertFalse(model.isPerformingFileOperation)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["sample.txt"])
     }
 
     func testDroppedDirectoryCanNavigateTargetPaneWithoutMovingIt() throws {
